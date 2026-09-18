@@ -29,10 +29,11 @@ async function limit(req:Request,env:Env,account=''){
 function publicUser(u:User){return {id:u.id,name:u.name,role:u.role}}
 const actionSchema=z.discriminatedUnion('action',[
  z.object({action:z.literal('create'),revision:z.number().int().nonnegative(),event:z.object({title:z.string().trim().min(1).max(60),type:z.enum(['训练','比赛']),date:z.string().regex(/^\d{4}-\d\d-\d\dT\d\d:\d\d$/),place:z.string().trim().min(1).max(100)})}),
- z.object({action:z.enum(['respond','attendance']),revision:z.number().int().nonnegative(),eventId:z.string().max(100),memberId:z.string().max(100),status:z.string().max(10)}),
+ z.object({action:z.literal('respond'),revision:z.number().int().nonnegative(),eventId:z.string().max(100),memberId:z.string().max(100),status:z.string().max(10),reason:z.string().max(200).optional()}),
+ z.object({action:z.literal('attendance'),revision:z.number().int().nonnegative(),eventId:z.string().max(100),memberId:z.string().max(100),status:z.string().max(10)}),
  z.object({action:z.enum(['bulk','close']),revision:z.number().int().nonnegative(),eventId:z.string().max(100)})
 ]);
-async function snapshot(env:Env,u:User){const row=await env.DB.prepare('SELECT data,revision FROM team_state WHERE id=?').bind('team').first<{data:string;revision:number}>();if(!row)throw new ApiError(503,'球队资料尚未初始化');const members=(await env.DB.prepare('SELECT id,name,role,joined_at FROM members WHERE enabled=1 ORDER BY rowid').all<Member>()).results;const events:Event[]=JSON.parse(row.data);if(u.role==='队员')for(const e of events)e.attendance=e.attendance[u.id]?{[u.id]:e.attendance[u.id]}:{};return {team:{members,events},revision:row.revision,me:publicUser(u)}}
+async function snapshot(env:Env,u:User){const row=await env.DB.prepare('SELECT data,revision FROM team_state WHERE id=?').bind('team').first<{data:string;revision:number}>();if(!row)throw new ApiError(503,'球队资料尚未初始化');const members=(await env.DB.prepare('SELECT id,name,role,joined_at FROM members WHERE enabled=1 ORDER BY rowid').all<Member>()).results;const events:Event[]=JSON.parse(row.data);for(const e of events){const reasons=e.leaveReasons||{};if(u.role!=='管理员')e.leaveReasons=u.role==='队员'&&reasons[u.id]?{[u.id]:reasons[u.id]}:{};if(u.role==='队员')e.attendance=e.attendance[u.id]?{[u.id]:e.attendance[u.id]}:{}}return {team:{members,events},revision:row.revision,me:publicUser(u)}}
 async function api(req:Request,env:Env,ctx:ExecutionContext){
  const url=new URL(req.url),path=url.pathname;
  if(req.method!=='GET'&&req.method!=='POST')throw new ApiError(405,'不支持的操作');
@@ -113,7 +114,9 @@ async function api(req:Request,env:Env,ctx:ExecutionContext){
    if(p.action==='respond'||p.action==='attendance'){
     if(!participants.some(m=>m.id===p.memberId))throw new ApiError(404,'该成员不在本场活动名单中');
     if(p.action==='respond'){
-     if(!['参加','待定','请假'].includes(p.status))throw new ApiError(400,'报名状态无效');if(e.closed||Date.parse(e.date+'+08:00')<=Date.now())throw new ApiError(400,'活动已截止报名');e.responses[u.id]=p.status;
+     if(!['参加','待定','请假'].includes(p.status))throw new ApiError(400,'报名状态无效');if(e.closed||Date.parse(e.date+'+08:00')<=Date.now())throw new ApiError(400,'活动已截止报名');
+     if(p.status==='请假'){const reason=p.reason?.trim();if(!reason||Array.from(reason).length>50)throw new ApiError(400,'请填写 1～50 字的请假理由');e.leaveReasons??={};e.leaveReasons[u.id]=reason}else if(e.leaveReasons)delete e.leaveReasons[u.id];
+     e.responses[u.id]=p.status;
     }else{
      if(!['到场','迟到','请假','缺席','未点名'].includes(p.status)||(e.closed&&p.status==='未点名'))throw new ApiError(400,'出勤状态无效');e.attendance[p.memberId]=p.status;
     }

@@ -1,5 +1,5 @@
 export type Member = { id: string; name: string; role: "管理员" | "教练" | "队员"; joined_at?: number };
-export type Event = { id: string; title: string; type: string; date: string; place: string; closed: boolean; responses: Record<string, string>; attendance: Record<string, string> };
+export type Event = { id: string; title: string; type: string; date: string; place: string; closed: boolean; responses: Record<string, string>; attendance: Record<string, string>; leaveReasons?: Record<string, string> };
 export type Team = { members: Member[]; events: Event[] };
 
 // A separate record keeps the trial history from being attributed to real members.
