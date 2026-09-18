@@ -32,7 +32,7 @@ const actionSchema=z.discriminatedUnion('action',[
  z.object({action:z.enum(['respond','attendance']),revision:z.number().int().nonnegative(),eventId:z.string().max(100),memberId:z.string().max(100),status:z.string().max(10)}),
  z.object({action:z.enum(['bulk','close']),revision:z.number().int().nonnegative(),eventId:z.string().max(100)})
 ]);
-async function snapshot(env:Env,u:User){const row=await env.DB.prepare('SELECT data,revision FROM team_state WHERE id=?').bind('team').first<{data:string;revision:number}>();if(!row)throw new ApiError(503,'球队资料尚未初始化');const members=(await env.DB.prepare('SELECT id,name,role FROM members WHERE enabled=1 ORDER BY id').all<Member>()).results;const events:Event[]=JSON.parse(row.data);if(u.role==='队员')for(const e of events)e.attendance=e.attendance[u.id]?{[u.id]:e.attendance[u.id]}:{};return {team:{members,events},revision:row.revision,me:publicUser(u)}}
+async function snapshot(env:Env,u:User){const row=await env.DB.prepare('SELECT data,revision FROM team_state WHERE id=?').bind('team').first<{data:string;revision:number}>();if(!row)throw new ApiError(503,'球队资料尚未初始化');const members=(await env.DB.prepare('SELECT id,name,role,joined_at FROM members WHERE enabled=1 ORDER BY rowid').all<Member>()).results;const events:Event[]=JSON.parse(row.data);if(u.role==='队员')for(const e of events)e.attendance=e.attendance[u.id]?{[u.id]:e.attendance[u.id]}:{};return {team:{members,events},revision:row.revision,me:publicUser(u)}}
 async function api(req:Request,env:Env,ctx:ExecutionContext){
  const url=new URL(req.url),path=url.pathname;
  if(req.method!=='GET'&&req.method!=='POST')throw new ApiError(405,'不支持的操作');
@@ -65,7 +65,31 @@ async function api(req:Request,env:Env,ctx:ExecutionContext){
  if(path==='/api/team'&&req.method==='GET')return json(await snapshot(env,u));
  if(path==='/api/admin/members'&&req.method==='GET'){
   if(u.role!=='管理员')throw new ApiError(403,'仅管理员可以管理账号');
-  return json({members:(await env.DB.prepare('SELECT id,name,role,enabled,password_hash IS NOT NULL AS activated,invite_expires FROM members ORDER BY id').all()).results});
+  return json({members:(await env.DB.prepare('SELECT id,name,role,enabled,password_hash IS NOT NULL AS activated,invite_expires FROM members ORDER BY rowid').all()).results});
+ }
+ if(path==='/api/admin/members'&&req.method==='POST'){
+  if(u.role!=='管理员')throw new ApiError(403,'仅管理员可以维护名单');
+  const p=z.discriminatedUnion('action',[
+   z.object({action:z.literal('add'),name:z.string().trim().min(1).max(40)}),
+   z.object({action:z.literal('rename'),memberId:z.string().max(100),name:z.string().trim().min(1).max(40)})
+  ]).parse(await body());
+  const duplicate=await env.DB.prepare('SELECT id FROM members WHERE name=?').bind(p.name).first<{id:string}>();
+  if(duplicate&&('memberId' in p?duplicate.id!==p.memberId:true))throw new ApiError(409,'名单中已有这个姓名');
+  if(p.action==='add'){
+   const id=`member-${crypto.randomUUID()}`;
+   await env.DB.batch([
+    env.DB.prepare("INSERT INTO members(id,name,role,joined_at) VALUES(?,?,'队员',?)").bind(id,p.name,now()),
+    env.DB.prepare('INSERT INTO audit(actor,action,detail,created_at) VALUES(?,?,?,?)').bind(u.id,'member_add',JSON.stringify({memberId:id,name:p.name}),now())
+   ]);
+   return json({member:{id,name:p.name,role:'队员'},message:'已添加队员，请为其生成专属邀请'},201);
+  }
+  const old=await env.DB.prepare('SELECT id,name FROM members WHERE id=? AND enabled=1').bind(p.memberId).first<{id:string;name:string}>();
+  if(!old)throw new ApiError(404,'成员不存在');
+  if(old.name!==p.name)await env.DB.batch([
+   env.DB.prepare('UPDATE members SET name=? WHERE id=?').bind(p.name,p.memberId),
+   env.DB.prepare('INSERT INTO audit(actor,action,detail,created_at) VALUES(?,?,?,?)').bind(u.id,'member_rename',JSON.stringify({memberId:p.memberId,oldName:old.name,newName:p.name}),now())
+  ]);
+  return json({member:{id:p.memberId,name:p.name},message:'姓名已更新，原出勤记录和账号保持关联'});
  }
  if(path==='/api/admin/invite'&&req.method==='POST'){
   if(u.role!=='管理员')throw new ApiError(403,'仅管理员可以发放邀请');
@@ -80,20 +104,21 @@ async function api(req:Request,env:Env,ctx:ExecutionContext){
   if(p.action==='create'&&u.role!=='管理员')throw new ApiError(403,'仅管理员可以创建活动');
   if(['attendance','bulk','close'].includes(p.action)&&u.role==='队员')throw new ApiError(403,'仅管理员和教练可以点名');
   const row=await env.DB.prepare('SELECT data,revision FROM team_state WHERE id=?').bind('team').first<{data:string;revision:number}>();if(!row)throw new ApiError(503,'球队尚未初始化');if(p.revision!==row.revision)throw new ApiError(409,'记录已更新，请刷新后重试');
-  const events:Event[]=JSON.parse(row.data);const members=(await env.DB.prepare("SELECT id FROM members WHERE enabled=1 AND role<>'教练'").all<{id:string}>()).results;
+  const events:Event[]=JSON.parse(row.data);const members=(await env.DB.prepare("SELECT id,joined_at FROM members WHERE enabled=1 AND role<>'教练'").all<{id:string;joined_at:number}>()).results;
   if(p.action==='create'){
    const start=Date.parse(p.event.date+'+08:00');if(!Number.isFinite(start)||start<=Date.now())throw new ApiError(400,'请选择未来的活动时间');events.unshift({...p.event,id:crypto.randomUUID(),closed:false,responses:{},attendance:{}});
   }else{
    const e=events.find(e=>e.id===p.eventId);if(!e)throw new ApiError(404,'活动不存在');
+   const participants=members.filter(m=>Date.parse(e.date+'+08:00')>=m.joined_at*1000);
    if(p.action==='respond'||p.action==='attendance'){
-    if(!members.some(m=>m.id===p.memberId))throw new ApiError(404,'成员不存在');
+    if(!participants.some(m=>m.id===p.memberId))throw new ApiError(404,'该成员不在本场活动名单中');
     if(p.action==='respond'){
      if(!['参加','待定','请假'].includes(p.status))throw new ApiError(400,'报名状态无效');if(e.closed||Date.parse(e.date+'+08:00')<=Date.now())throw new ApiError(400,'活动已截止报名');e.responses[u.id]=p.status;
     }else{
      if(!['到场','迟到','请假','缺席','未点名'].includes(p.status)||(e.closed&&p.status==='未点名'))throw new ApiError(400,'出勤状态无效');e.attendance[p.memberId]=p.status;
     }
-   }else if(p.action==='bulk'){for(const m of members)if(e.responses[m.id]==='参加'&&(!e.attendance[m.id]||e.attendance[m.id]==='未点名'))e.attendance[m.id]='到场'}
-   else if(p.action==='close'){if(Date.parse(e.date+'+08:00')>Date.now())throw new ApiError(400,'活动开始后才能结束点名');if(members.some(m=>!e.attendance[m.id]||e.attendance[m.id]==='未点名'))throw new ApiError(400,'请先完成所有成员的点名');e.closed=true}
+   }else if(p.action==='bulk'){for(const m of participants)if(e.responses[m.id]==='参加'&&(!e.attendance[m.id]||e.attendance[m.id]==='未点名'))e.attendance[m.id]='到场'}
+   else if(p.action==='close'){if(Date.parse(e.date+'+08:00')>Date.now())throw new ApiError(400,'活动开始后才能结束点名');if(participants.some(m=>!e.attendance[m.id]||e.attendance[m.id]==='未点名'))throw new ApiError(400,'请先完成所有成员的点名');e.closed=true}
   }
   const results=await env.DB.batch([
    env.DB.prepare('UPDATE team_state SET data=?,revision=revision+1 WHERE id=? AND revision=?').bind(JSON.stringify(events),'team',row.revision),
